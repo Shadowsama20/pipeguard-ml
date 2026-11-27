@@ -102,6 +102,55 @@ train, test = split(X)
 """)
         self.assertEqual(result, (0, "", ""))
 
+    def test_cross_validation_consumes_preprocessed_features(self):
+        for function in ("cross_validate", "cross_val_score", "cross_val_predict"):
+            with self.subTest(function=function):
+                source = IMPORTS + f"from sklearn.model_selection import {function} as cv\n" + """
+train, test = split(X)
+scaled = Scaler().fit_transform(train)
+scores = cv(estimator=model, X=scaled, y=y_train)
+"""
+                status, output, errors = self.run_scan("cv.py", source)
+                self.assertEqual(status, 1)
+                self.assertEqual(errors, "")
+                self.assertIn("cv.py:6:10: PG004", output)
+
+    def test_parameter_search_consumes_transformed_features(self):
+        for search in ("GridSearchCV", "RandomizedSearchCV"):
+            with self.subTest(search=search):
+                source = IMPORTS + f"from sklearn.model_selection import {search} as Search\n" + """
+train, test = split(X)
+scaler = Scaler().fit(train)
+scaled = scaler.transform(train)
+search = Search(model, parameters)
+search.fit(scaled, y_train)
+"""
+                status, output, errors = self.run_scan("search.py", source)
+                self.assertEqual(status, 1)
+                self.assertEqual(errors, "")
+                self.assertIn("search.py:6:10: PG004", output)
+
+    def test_cv_does_not_report_fold_local_or_independent_fits(self):
+        source = IMPORTS + """
+from sklearn.model_selection import cross_val_score
+from sklearn.pipeline import make_pipeline
+unused = Scaler().fit_transform(X)
+pipeline = make_pipeline(Scaler(), model)
+cross_val_score(pipeline, X, y)
+external_scaler = Scaler().fit(reference)
+fixed = external_scaler.transform(X)
+cross_val_score(model, fixed, y)
+train, test = split(fixed)
+"""
+        self.assertEqual(self.run_scan("safe.py", source), (0, "", ""))
+
+    def test_rowwise_sklearn_scaling(self):
+        source = IMPORTS + """
+from sklearn.preprocessing import scale
+train, test = split(scale(X, axis=1))
+"""
+        self.assertEqual(self.run_scan("safe.py", source), (0, "", ""))
+
     def test_parse_failure(self):
         status, output, errors = self.run_scan("training.py", "if\n")
         self.assertEqual(status, 2)

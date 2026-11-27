@@ -22,6 +22,7 @@ The distribution name is `pipeguard-ml`. The installed command is `pipeguard`.
 | PG001 | A supported scikit-learn preprocessor learns from data that flows into a later recognized split. This covers `fit`, `fit_transform`, `partial_fit`, and helpers such as `scale`. |
 | PG002 | A supported scikit-learn preprocessor learns from data derived from the test output of a recognized split. |
 | PG003 | A statistic such as `mean`, `median`, or `std` flows into the input of a recognized split, as in pandas imputation or standardization. |
+| PG004 | Features learned by a supported scikit-learn preprocessor reach a cross-validation or parameter-search call. |
 
 For example, both preprocessing calls below use rows that can end up in the test set:
 
@@ -48,6 +49,24 @@ X_train = preprocess.fit_transform(X_train)
 X_test = preprocess.transform(X_test)
 ```
 
+## Cross-validation
+
+Fitting a scaler on the training partition before cross-validation still exposes each validation fold to statistics from its own rows. Pipeguard reports PG004 at the preprocessing line when the transformed features reach a supported evaluation call.
+
+```python
+from sklearn.model_selection import cross_val_score
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+scaled = StandardScaler().fit_transform(X_train)  # PG004
+scores = cross_val_score(model, scaled, y_train)
+
+pipeline = make_pipeline(StandardScaler(), model)
+scores = cross_val_score(pipeline, X_train, y_train)  # scaler fitted inside each fold
+```
+
+The rule recognizes `cross_val_score`, `cross_validate`, `cross_val_predict`, and calls to `.fit()` on `GridSearchCV` and `RandomizedSearchCV`. It tracks scikit-learn preprocessing outputs passed as features. Hand-written fold loops and pandas statistics before cross-validation are outside this rule's scope.
+
 ## Grouped holdout example
 
 The Kepler Exoplanet Transit Classifier holds out entire stars using a project helper. Run this from its checkout:
@@ -60,4 +79,4 @@ Use `--index-split` for an imported helper that takes features as its first posi
 
 ## Analysis scope
 
-Pipeguard recognizes explicit scikit-learn imports, common preprocessing modules, simple aliases, `train_test_split`, and configured index-split helpers. It analyzes notebooks in saved cell order and skips common IPython line magics and non-Python cell magics. Its checks use local data flow and source order. Dynamic calls, unconfigured custom splitters, cross-validation behavior, general data flow across helper calls, and notebook execution history are outside its model. The pandas rule matches method names and can also report statistics from pandas-like objects. Review findings in context.
+Pipeguard recognizes explicit scikit-learn imports, common preprocessing modules, simple aliases, `train_test_split`, and configured index-split helpers. It analyzes notebooks in saved cell order and skips common IPython line magics and non-Python cell magics. Its checks use local data flow and source order. Dynamic calls, unconfigured custom splitters, general data flow across helper calls, and notebook execution history are outside its model. The pandas rule matches method names and can also report statistics from pandas-like objects. Review findings in context.
