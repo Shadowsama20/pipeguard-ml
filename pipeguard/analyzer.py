@@ -18,6 +18,8 @@ STATISTICS = {
 }
 PANDAS_MUTATORS = {"fillna", "replace", "where", "mask", "clip"}
 STATELESS_PREPROCESSORS = {"Binarizer", "FunctionTransformer", "Normalizer"}
+CV_FUNCTIONS = {"cross_val_score", "cross_validate", "cross_val_predict"}
+CV_SEARCHES = {"sklearn.model_selection.GridSearchCV", "sklearn.model_selection.RandomizedSearchCV"}
 FIT_METHODS = {"fit", "fit_transform", "partial_fit"}
 
 
@@ -48,7 +50,8 @@ class Analyzer(ast.NodeVisitor):
         self.bindings: dict[str, Value] = {}
         self.diagnostics: set[Diagnostic] = set()
         self.fits: dict[int, set[Diagnostic]] = {}
-        self.fitted_inputs: dict[int, Value] = {}
+        self.fitted_inputs: dict[int, tuple[int, Value]] = {}
+        self.cv_findings: dict[int, Diagnostic] = {}
         self.next_key = count()
 
     def value(self, parts=(), *, partitions=(), qualified="", preprocessor=False,
@@ -189,6 +192,17 @@ class Analyzer(ast.NodeVisitor):
             return self.split([source]) if source is not None else self.value()
 
         package, _, member = qualified.rpartition(".")
+        if package == "sklearn.model_selection":
+            if qualified in CV_SEARCHES:
+                return self.value(qualified=qualified)
+            if member in CV_FUNCTIONS:
+                features = args[1] if len(args) > 1 else keywords.get("X")
+                self.check_cross_validation(features)
+                return self.value()
+        if method == "fit" and owner.qualified in CV_SEARCHES:
+            self.check_cross_validation(args[0] if args else keywords.get("X"))
+            return owner
+
         if package.startswith("sklearn.") and package.split(".")[1] in PREPROCESSOR_MODULES:
             if member[:1].isupper() or member in PREPROCESSOR_FACTORIES:
                 return self.value(preprocessor=member not in STATELESS_PREPROCESSORS)
@@ -198,18 +212,25 @@ class Analyzer(ast.NodeVisitor):
             }:
                 source = args[0] if args else keywords.get("X")
                 if source is not None:
-                    return self.fit(node, method or member, source)
+                    if any(kw.arg == "axis" and isinstance(kw.value, ast.Constant)
+                           and kw.value.value == 1 for kw in node.keywords):
+                        return self.value((source,))
+                    return self.fit(node, member, source)
 
         if owner and owner.preprocessor:
             source = args[0] if args else keywords.get("X")
             if method in FIT_METHODS and source is not None:
-                transformed = self.fit(node, method, source)
-                self.fitted_inputs[owner.key] = transformed
+                # A named estimator also retains learned state after the call.
+                retains_state = method != "fit_transform" or not isinstance(node.func.value, ast.Call)
+                transformed = self.fit(node, method, source, retains_state=retains_state)
+                self.fitted_inputs[owner.key] = (source.key, transformed)
                 return transformed if method == "fit_transform" else owner
             if method == "transform" and source is not None:
                 fitted = self.fitted_inputs.get(owner.key)
-                if fitted is not None and not fitted.partitions:
-                    return self.value((source, fitted))
+                if fitted is not None:
+                    fit_key, transformed = fitted
+                    if fit_key in source.lineage or source.key in transformed.lineage:
+                        return self.value((source, transformed))
                 return self.value((source,))
 
         if owner and method in STATISTICS and not (owner.qualified or owner.partitions):
@@ -233,15 +254,28 @@ class Analyzer(ast.NodeVisitor):
             self.bind(node.func.value, result)
         return result
 
-    def fit(self, node, method, source):
+    def fit(self, node, method, source, *, retains_state=False):
+        transformed = self.value((source,))
         if "test" in source.partitions:
             self.diagnostics.add(self.location(
                 node, "PG002", f"{method} learns from a held-out test partition"
             ))
         else:
             diagnostic = self.location(node, "PG001", f"{method} learns from data before it is split")
-            self.fits[source.key] = self.fits.get(source.key, set()) | {diagnostic}
-        return self.value((source,))
+            self.fits[transformed.key] = {diagnostic}
+            if retains_state:
+                self.fits[source.key] = self.fits.get(source.key, set()) | {diagnostic}
+        self.cv_findings[transformed.key] = self.location(
+            node, "PG004", f"{method} learns from features before cross-validation. "
+            "fit preprocessing inside each fold using a Pipeline"
+        )
+        return transformed
+
+    def check_cross_validation(self, features):
+        if features is not None:
+            self.diagnostics.update(
+                self.cv_findings[key] for key in features.lineage if key in self.cv_findings
+            )
 
     def split(self, args):
         items = []
